@@ -1,0 +1,20 @@
+# Core dependencies for onto-cgans
+copulas
+numpy
+pandas
+torch
+scipy
+matplotlib
+scikit-learn
+graphviz
+pyreadstat
+typer
+tqdm
+gensim
+six
+packaging
+
+# Optional: LLM backends
+# openai
+# transformers
+# accelerate

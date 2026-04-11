@@ -1,0 +1,144 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+requires-python = ">=3.10"
+name = "onto-cgans"
+description = "Ontology-conditioned Conditional GAN for synthetic tabular data generation using ontology embeddings as conditional vectors."
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+authors = [
+    { name = "Sun Chang", email = "sunchang0124@gmail.com" },
+]
+maintainers = [
+    { name = "Sun Chang", email = "sunchang0124@gmail.com" },
+]
+keywords = [ "CGAN", "synthetic data", "ontology", "GAN", "knowledge graph" ]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dynamic = ["version"]
+
+dependencies = [
+    "copulas",
+    "numpy",
+    "pandas",
+    "torch",
+    "scipy",
+    "matplotlib",
+    "scikit-learn",
+    "graphviz",
+    "pyreadstat",
+    "typer",
+    "tqdm",
+    "gensim",
+    "six",
+    "packaging",
+]
+
+
+[project.scripts]
+onto-cgans = "onto_cgans.__main__:cli"
+
+
+[project.optional-dependencies]
+llm = [
+    "openai",
+    "transformers",
+    "accelerate",
+]
+test = [
+    "pytest >=7.4.0",
+    "pytest-cov >=3.0.0",
+    "ruff",
+    "black",
+    "mypy >=1.4.1",
+    "pip-tools",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/sunchang0124/dp_cgans"
+Documentation = "https://github.com/sunchang0124/dp_cgans"
+History = "https://github.com/sunchang0124/dp_cgans/releases"
+Tracker = "https://github.com/sunchang0124/dp_cgans/issues"
+Source = "https://github.com/sunchang0124/dp_cgans"
+
+
+[tool.hatch.envs.default]
+features = ["test"]
+
+[tool.hatch.envs.default.scripts]
+fmt = [
+    "black src",
+    "ruff src --fix",
+]
+test = ["pytest {args}"]
+cov = ["pytest --cov-report html {args}"]
+requirements = "pip-compile -o requirements.txt pyproject.toml"
+
+
+[[tool.hatch.envs.all.matrix]]
+python = ["3.10", "3.11", "3.12", "3.13"]
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onto_cgans"]
+
+[tool.hatch.version]
+path = "src/onto_cgans/__init__.py"
+
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+omit = ["tests/*"]
+
+
+[tool.pytest.ini_options]
+addopts = [
+    "-vvv",
+    "--durations=10",
+    "--cov=src",
+    "--color=yes",
+    "--cov-report=term-missing",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+
+[tool.black]
+color = true
+line-length = 120
+target-version = ['py310']
+skip-string-normalization = false
+
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py310"
+line-length = 120
+select = [
+    "I", "N", "S", "A", "YTT", "B", "C", "ICN", "SIM", "TID", "Q",
+    "F", "UP", "E", "W", "PLC", "PLE", "PLW", "RUF", "T",
+]
+ignore = [
+    "E501",
+    "C901",
+    "T201",
+    "B008",
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["I", "F401"]
+"tests/**/*" = ["PLR2004", "S101", "S105", "TID252"]

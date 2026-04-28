@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 name = "onto-cgans"
 description = "Ontology-conditioned Conditional GAN for synthetic tabular data generation using ontology embeddings as conditional vectors."
 readme = "README.md"

@@ -216,7 +216,8 @@ class Onto_DP_CGAN(Onto_DPCGANModel):
                  epochs=300, pac=10, cuda=True, rounding='auto',
                  min_value='auto', max_value='auto', private=False, wandb=False,
                  conditioning_mode='ontology',
-                 clinical_prior=None):
+                 clinical_prior=None,
+                 saved_transformer=None):
         super().__init__(
             field_names=field_names,
             primary_key=primary_key,
@@ -251,5 +252,6 @@ class Onto_DP_CGAN(Onto_DPCGANModel):
             'wandb': wandb,
             'conditioning_mode': conditioning_mode,
             'clinical_prior': clinical_prior,
+            'saved_transformer': saved_transformer,
         }
 

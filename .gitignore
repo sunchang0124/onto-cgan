@@ -28,6 +28,10 @@ data/ontology_emb/ontology.embeddings
 data/ontology_emb/ontology.embeddings.syn1neg.npy
 data/ontology_emb/ontology.embeddings.wv.vectors.npy
 
+# Embeddings folder contents (keep folder, ignore files)
+embeddings/*
+!embeddings/.gitkeep
+
 # GAN model pickles (large binary outputs)
 output/**/*.pkl
 
@@ -62,3 +66,15 @@ Thumbs.db
 # Logs
 *.log
 log_file*
+
+# Output and test artifacts
+output/
+tests/
+
+# Local context files
+README_for_Claude.md
+
+# Claude Code / Codex local config
+.claude/
+.codex
+.codex/

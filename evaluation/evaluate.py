@@ -48,15 +48,15 @@ from sklearn.metrics import (
     f1_score, recall_score, precision_score,
     roc_auc_score, average_precision_score,
 )
-
 from utils import (
-    ROOT, EMB_DIR, UNSEEN_IRI, UNSEEN_LABEL, LABEL_COL,
-    load_and_split, load_kfold, load_data, prepare_features, ALL_FEAT_COLS,
+    ROOT, EMB_DIR,
+    load_and_split, load_kfold, load_data, prepare_features,
+    CONFIGS, ExperimentConfig,
 )
 
 
-N_SYN  = 1340   # 5 × total AML count (268)
-MODES  = ["ontology", "decoder", "decoder_contrast", "decoder_var"]
+N_SYN_MULTIPLIER = 5   # synthetic rows = N_SYN_MULTIPLIER × real unseen count
+
 
 CLASSIFIERS = {
     'RandomForest': RandomForestClassifier(
@@ -67,22 +67,55 @@ CLASSIFIERS = {
 }
 
 
+def _build_classifiers_from_params(params: dict) -> dict:
+    """Reconstruct CLASSIFIERS from a tune_classifiers.py best-params JSON.
+
+    Grid params come from the JSON; fixed params (class_weight, random_state,
+    n_jobs for RF) are re-applied here so the JSON stays minimal.
+    Any classifier missing from the JSON falls back to the default in CLASSIFIERS.
+    """
+    clfs = {}
+    if 'RandomForest' in params:
+        clfs['RandomForest'] = RandomForestClassifier(
+            **params['RandomForest'],
+            class_weight='balanced', random_state=42, n_jobs=-1)
+    else:
+        clfs['RandomForest'] = CLASSIFIERS['RandomForest']
+
+    if 'KNN' in params:
+        clfs['KNN'] = KNeighborsClassifier(**params['KNN'])
+    else:
+        clfs['KNN'] = CLASSIFIERS['KNN']
+
+    if 'GaussianNB' in params:
+        clfs['GaussianNB'] = GaussianNB(**params['GaussianNB'])
+    else:
+        clfs['GaussianNB'] = CLASSIFIERS['GaussianNB']
+
+    return clfs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Post-hoc filters
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Classifier helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_classifier(clf_template, train_df, feat_cols, extra_df=None):
+def train_classifier(clf_template, train_df, feat_cols, label_col, extra_df=None):
     import copy
-    clf = copy.deepcopy(clf_template)
     combined = pd.concat([train_df, extra_df], ignore_index=True) \
                if extra_df is not None and len(extra_df) > 0 else train_df
-    X, y = prepare_features(combined, feat_cols)
+    X, y = prepare_features(combined, feat_cols, label_col=label_col)
+    clf = copy.deepcopy(clf_template)
     clf.fit(X, y)
     return clf
 
 
-def evaluate_on_unseen(clf, test_df, feat_cols, unseen_label=UNSEEN_LABEL):
-    X_test, y_test = prepare_features(test_df, feat_cols)
+def evaluate_on_unseen(clf, test_df, feat_cols, label_col, unseen_label):
+    X_test, y_test = prepare_features(test_df, feat_cols, label_col=label_col)
     classes = list(clf.classes_)
 
     y_pred  = clf.predict(X_test)
@@ -110,7 +143,15 @@ def evaluate_on_unseen(clf, test_df, feat_cols, unseen_label=UNSEEN_LABEL):
     except Exception:
         roc_auc_multi = float('nan')
 
-    tp = int((y_pred[y_bin == 1] == unseen_label).sum())
+    y_pred_bin = (y_pred == unseen_label).astype(int)
+    tp = int(((y_bin == 1) & (y_pred_bin == 1)).sum())
+    fp = int(((y_bin == 0) & (y_pred_bin == 1)).sum())
+    fn = int(((y_bin == 1) & (y_pred_bin == 0)).sum())
+    tn = int(((y_bin == 0) & (y_pred_bin == 0)).sum())
+
+    from sklearn.metrics import confusion_matrix as _cm
+    conf_mat = _cm(y_test, y_pred, labels=classes)
+
     return {
         'recall':                 round(rec, 4),
         'precision':              round(prec, 4),
@@ -119,7 +160,9 @@ def evaluate_on_unseen(clf, test_df, feat_cols, unseen_label=UNSEEN_LABEL):
         'pr_auc_aml':             round(avg_prec, 4),
         'roc_auc_multiclass':     round(roc_auc_multi, 4),
         'n_unseen_test':          int(y_bin.sum()),
-        'n_correctly_identified': tp,
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+        'conf_matrix':            conf_mat,
+        'conf_classes':           classes,
     }
 
 
@@ -145,25 +188,31 @@ def compute_stat_similarity(real_df, synth_df, feat_cols):
             'KS p-value':   round(ks_p, 4),
             'Wasserstein':  round(wasserstein_distance(r, s), 4),
         })
-    return pd.DataFrame(rows).set_index('Feature')
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.set_index('Feature')
 
 
-def plot_kde(real_aml, real_other, synth_dict, feat_cols, save_path, modes):
+def plot_kde(real_aml, real_other, synth_dict, feat_cols, save_path, modes,
+             unseen_label="unseen"):
     colors = {
-        'Other diseases':   'steelblue',
-        'Real AML':         'black',
-        'ontology':         '#1a5276',
-        'prior':            '#1e8449',
-        'decoder':          '#d35400',
-        'decoder_contrast': '#c0392b',
-        'decoder_var':      '#6c3483',
+        'Other diseases':        'steelblue',
+        f'Real {unseen_label}':  'black',
+        'ontology':              '#1a5276',
+        'prior':                 '#1e8449',
+        'decoder':               '#d35400',
+        'decoder_contrast':      '#c0392b',
+        'decoder_var':           '#6c3483',
+
     }
     linestyles = {
-        'ontology':         '--',
-        'prior':            '--',
-        'decoder':          '--',
-        'decoder_contrast': '-.',
-        'decoder_var':      (0, (3, 1, 1, 1)),
+        'ontology':              '--',
+        'prior':                 '--',
+        'decoder':               '--',
+        'decoder_contrast':      '-.',
+        'decoder_var':           (0, (3, 1, 1, 1)),
+
     }
     n_cols = 2
     n_rows = (len(feat_cols) + 1) // 2
@@ -173,8 +222,8 @@ def plot_kde(real_aml, real_other, synth_dict, feat_cols, save_path, modes):
         ax = axes[i]
         sns.kdeplot(real_other[feat].dropna(), ax=ax, color=colors['Other diseases'],
                     linewidth=1.5, label='Other diseases', fill=True, alpha=0.15)
-        sns.kdeplot(real_aml[feat].dropna(), ax=ax, color=colors['Real AML'],
-                    linewidth=2.5, label='Real AML', fill=True, alpha=0.15)
+        sns.kdeplot(real_aml[feat].dropna(), ax=ax, color=colors[f'Real {unseen_label}'],
+                    linewidth=2.5, label=f'Real {unseen_label}', fill=True, alpha=0.15)
         for mode in modes:
             s = synth_dict.get(mode)
             if s is not None and feat in s.columns:
@@ -190,7 +239,7 @@ def plot_kde(real_aml, real_other, synth_dict, feat_cols, save_path, modes):
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='lower right', fontsize=10,
                bbox_to_anchor=(0.98, 0.02), framealpha=0.9)
-    fig.suptitle('Distribution: Other diseases vs Real AML vs Synthetic AML',
+    fig.suptitle(f'Distribution: Other diseases vs Real {unseen_label} vs Synthetic {unseen_label}',
                  fontsize=13, fontweight='bold', y=1.01)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -202,37 +251,64 @@ def plot_kde(real_aml, real_other, synth_dict, feat_cols, save_path, modes):
 # Statistical analysis (run once — independent of train/test splits)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_stat_analysis(gan_models, base_dir):
-    """Compare all real AML vs synthetic AML per mode. Runs once, no splits.
+def run_stat_analysis(gan_models, base_dir, cfg, n_syn):
+    """Compare all real unseen vs synthetic unseen per mode. Runs once, no splits."""
+    df_full, clf_feat_cols = load_data(cfg)
+    real_unseen = df_full[df_full[cfg.label_col] == cfg.unseen_label][clf_feat_cols]
+    real_other  = df_full[df_full[cfg.label_col] != cfg.unseen_label][clf_feat_cols]
+    print(f"\n  Statistical analysis: {len(real_unseen)} real {cfg.unseen_label} patients")
 
-    Uses the full clean cohort (199 AML after multi-disease exclusion) so the
-    statistical comparison is not biased by a particular fold or seed.
-    Saves stat_similarity_S2_{mode}.csv and kde_comparison.png to base_dir.
-    """
-    df_full, clf_feat_cols = load_data()
-    real_aml   = df_full[df_full[LABEL_COL] == UNSEEN_LABEL][clf_feat_cols]
-    real_other = df_full[df_full[LABEL_COL] != UNSEEN_LABEL][clf_feat_cols]
-    print(f"\n  Statistical analysis: {len(real_aml)} real AML patients")
+    # dropna threshold: keep rows with at least half of feature columns non-null
+    dropna_thresh = max(1, len(clf_feat_cols) // 2)
 
-    synth_dict     = {}
+    synth_dict      = {}
     available_modes = []
     for mode, gan_model in gan_models.items():
-        synth = gan_model.sample(N_SYN, unseen_rds=[UNSEEN_IRI])
-        synth = synth.dropna(thresh=16)
+        synth = gan_model.sample(n_syn, unseen_rds=[cfg.unseen_iri])
+        synth = synth.dropna(thresh=dropna_thresh)
         synth_features = synth.drop(columns=['IRI'], errors='ignore')
-        synth_unseen = synth_features[synth_features[LABEL_COL] == UNSEEN_LABEL].copy() \
-                       if LABEL_COL in synth_features.columns else synth_features.copy()
-        synth_feats = synth_unseen[[c for c in clf_feat_cols if c in synth_unseen.columns]]
+        synth_unseen = synth_features[
+            synth_features[cfg.label_col] == cfg.unseen_label].copy() \
+            if cfg.label_col in synth_features.columns else synth_features.copy()
+        synth_feats = synth_unseen[
+            [c for c in clf_feat_cols if c in synth_unseen.columns]]
 
-        sim = compute_stat_similarity(real_aml, synth_feats, clf_feat_cols)
+        sim = compute_stat_similarity(real_unseen, synth_feats, clf_feat_cols)
         sim.to_csv(base_dir / f"stat_similarity_S2_{mode}.csv")
         print(f"  Saved → stat_similarity_S2_{mode}.csv")
 
         synth_dict[mode] = synth_feats
         available_modes.append(mode)
 
-    plot_kde(real_aml, real_other, synth_dict, clf_feat_cols,
-             base_dir / "kde_comparison.png", available_modes)
+
+    plot_kde(real_unseen, real_other, synth_dict, clf_feat_cols,
+             base_dir / "kde_comparison.png", available_modes,
+             unseen_label=cfg.unseen_label)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Random noise baseline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_random_unseen(seen_train, feat_cols, label_col, unseen_label,
+                           n_syn, random_state=42):
+    """Generate n_syn rows of per-feature uniform random values labeled as the unseen disease.
+
+    Each feature is sampled uniformly within [min, max] observed in seen_train.
+    This serves as a lower bound for GAN utility: if the GAN cannot beat random
+    noise, it is adding no useful signal.
+    """
+    rng = np.random.default_rng(random_state)
+    data = {}
+    for col in feat_cols:
+        col_vals = seen_train[col].dropna() if col in seen_train.columns else pd.Series(dtype=float)
+        if len(col_vals) == 0:
+            data[col] = np.zeros(n_syn)
+        else:
+            data[col] = rng.uniform(col_vals.min(), col_vals.max(), size=n_syn)
+    df = pd.DataFrame(data)
+    df[label_col] = unseen_label
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,43 +316,71 @@ def run_stat_analysis(gan_models, base_dir):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_split(seen_train, unseen_train, test_df, clf_feat_cols,
-                   gan_models, include_s3):
+                   gan_models, include_s3, cfg, n_syn, classifiers=None,
+                   random_state=42):
     """Sample from GANs, train classifiers, return list of result dicts."""
+    if classifiers is None:
+        classifiers = CLASSIFIERS
+
+    # dropna threshold: keep rows with at least half of feature columns non-null
+    dropna_thresh = max(1, len(clf_feat_cols) // 2)
 
     available_modes     = []
     synth_features_dict = {}
 
     for mode, gan_model in gan_models.items():
-        synth = gan_model.sample(N_SYN, unseen_rds=[UNSEEN_IRI])
-        synth = synth.dropna(thresh=16)
+        import random as _random
+        import torch as _torch
+        _random.seed(random_state)
+        np.random.seed(random_state)
+        _torch.manual_seed(random_state)
+        synth = gan_model.sample(n_syn, unseen_rds=[cfg.unseen_iri])
+        synth = synth.dropna(thresh=dropna_thresh)
         synth_features = synth.drop(columns=['IRI'], errors='ignore')
-        synth_unseen = synth_features[synth_features[LABEL_COL] == UNSEEN_LABEL].copy() \
-                       if LABEL_COL in synth_features.columns else synth_features.copy()
+        synth_unseen = synth_features[
+            synth_features[cfg.label_col] == cfg.unseen_label].copy() \
+            if cfg.label_col in synth_features.columns else synth_features.copy()
         synth_features_dict[mode] = (synth_features, synth_unseen)
         available_modes.append(mode)
 
+
+    # Build random baseline once (same n_syn, independent of classifier)
+    random_unseen = generate_random_unseen(
+        seen_train, clf_feat_cols, cfg.label_col, cfg.unseen_label, n_syn,
+        random_state=random_state)
+
     all_results = []
-    for clf_name, clf_template in CLASSIFIERS.items():
-        # S1
-        clf_s1 = train_classifier(clf_template, seen_train, clf_feat_cols)
-        res = evaluate_on_unseen(clf_s1, test_df, clf_feat_cols)
-        res.update({'Classifier': clf_name, 'Scenario': 'S1 — Baseline'})
+    for clf_name, clf_template in classifiers.items():
+        # S1 — Random noise (uniform per-feature within seen-train range)
+        clf_rand = train_classifier(clf_template, seen_train, clf_feat_cols,
+                                    label_col=cfg.label_col,
+                                    extra_df=random_unseen)
+        res = evaluate_on_unseen(clf_rand, test_df, clf_feat_cols,
+                                 label_col=cfg.label_col,
+                                 unseen_label=cfg.unseen_label)
+        res.update({'Classifier': clf_name, 'Scenario': 'S1 — Random noise'})
         all_results.append(res)
 
         # S2
         for mode in available_modes:
             synth_features, _ = synth_features_dict[mode]
             clf_s2 = train_classifier(clf_template, seen_train, clf_feat_cols,
+                                      label_col=cfg.label_col,
                                       extra_df=synth_features)
-            res = evaluate_on_unseen(clf_s2, test_df, clf_feat_cols)
+            res = evaluate_on_unseen(clf_s2, test_df, clf_feat_cols,
+                                     label_col=cfg.label_col,
+                                     unseen_label=cfg.unseen_label)
             res.update({'Classifier': clf_name, 'Scenario': f'S2 — {mode}'})
             all_results.append(res)
 
         # S3
         if include_s3 and len(unseen_train) > 0:
             clf_s3 = train_classifier(clf_template, seen_train, clf_feat_cols,
+                                      label_col=cfg.label_col,
                                       extra_df=unseen_train)
-            res = evaluate_on_unseen(clf_s3, test_df, clf_feat_cols)
+            res = evaluate_on_unseen(clf_s3, test_df, clf_feat_cols,
+                                     label_col=cfg.label_col,
+                                     unseen_label=cfg.unseen_label)
             res.update({'Classifier': clf_name, 'Scenario': 'S3 — Upper bound (real)'})
             all_results.append(res)
 
@@ -287,8 +391,8 @@ def evaluate_split(seen_train, unseen_train, test_df, clf_feat_cols,
 # Aggregation
 # ══════════════════════════════════════════════════════════════════════════════
 
-METRIC_COLS = ['Recall (AML)', 'Precision (AML)', 'F1 (AML)',
-               'ROC-AUC (AML)', 'PR-AUC (AML)', 'ROC-AUC (multiclass OvO)']
+METRIC_COLS = ['Recall', 'Precision', 'F1',
+               'ROC-AUC (unseen)', 'PR-AUC (unseen)', 'ROC-AUC (multiclass OvO)']
 
 
 def results_to_df(all_results, fold=None):
@@ -297,13 +401,16 @@ def results_to_df(all_results, fold=None):
         row = {
             'Classifier':               r['Classifier'],
             'Scenario':                 r['Scenario'],
-            'Recall (AML)':             r['recall'],
-            'Precision (AML)':          r['precision'],
-            'F1 (AML)':                 r['f1'],
-            'ROC-AUC (AML)':            r['roc_auc_aml'],
-            'PR-AUC (AML)':             r['pr_auc_aml'],
+            'Recall':                   r['recall'],
+            'Precision':                r['precision'],
+            'F1':                       r['f1'],
+            'ROC-AUC (unseen)':         r['roc_auc_aml'],
+            'PR-AUC (unseen)':          r['pr_auc_aml'],
             'ROC-AUC (multiclass OvO)': r['roc_auc_multiclass'],
-            'TP':                       r['n_correctly_identified'],
+            'TP':                       r['tp'],
+            'FP':                       r['fp'],
+            'FN':                       r['fn'],
+            'TN':                       r['tn'],
             'N unseen test':            r['n_unseen_test'],
         }
         if fold is not None:
@@ -327,42 +434,186 @@ def aggregate_cv(all_fold_dfs):
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main(model_dir, include_s3=False, cv=False, n_splits=5,
-         random_state=42, out_dir=None, stat_only=False, ml_only=False):
-    model_dir = Path(model_dir)
+def save_confusion_matrices(all_results, base_dir):
+    """Save one confusion-matrix CSV per classifier × scenario (single-seed only)."""
+    for r in all_results:
+        clf_name = r['Classifier']
+        safe_scenario = (r['Scenario']
+                         .replace(' — ', '_').replace('—', '_')
+                         .replace(' ', '_').replace('(', '').replace(')', ''))
+        classes = r['conf_classes']
+        mat     = r['conf_matrix']
+        df_cm   = pd.DataFrame(mat, index=classes, columns=classes)
+        df_cm.index.name   = 'actual \\ predicted'
+        fname = f"confusion_matrix_{clf_name}_{safe_scenario}.csv"
+        df_cm.to_csv(base_dir / fname)
+        print(f"  Saved → {fname}")
+
+
+_KNOWN_EMBEDDINGS = {'gensim', 'hit', 'sapbert', 'biolord', 'pubmedbert'}
+
+
+def _emb_suffix_from_dirname(dir_name: str) -> str:
+    """Return '_hit', '_biolord', etc. if the directory name ends with a known
+    embedding name, otherwise return ''.
+
+    Handles names like 'synthetic_epoch_2000_hit' → '_hit',
+    'synthetic_epoch_2000' → '', 'synthetic_epoch_3000_biolord' → '_biolord'.
+    """
+    for emb in _KNOWN_EMBEDDINGS:
+        if dir_name == emb or dir_name.endswith(f"_{emb}"):
+            return f"_{emb}"
+    return ""
+
+
+def _discover_models(model_dirs: list) -> dict:
+    """Scan one or more directories for gan_model_S2_*.pkl files.
+
+    Embedding names are extracted from directory names
+    (e.g. synthetic_epoch_2000_hit → suffix '_hit') and appended to the
+    mode key, so decoder_hit, decoder_biolord, etc. are treated as
+    distinct modes rather than overwriting each other.
+
+    When the same mode+embedding key appears in multiple dirs, the one from
+    the lexicographically latest directory name wins (higher epoch = later).
+    Returns {mode: Path} ordered by mode name.
+    """
+    found: dict = {}
+    for d in sorted(model_dirs):  # sort so later epochs overwrite earlier ones
+        d = Path(d)
+        if not d.is_dir():
+            continue
+        emb_sfx = _emb_suffix_from_dirname(d.name)
+        for pkl in sorted(d.glob("gan_model_S2_*.pkl")):
+            base_mode = pkl.stem.replace("gan_model_S2_", "")
+            mode = base_mode + emb_sfx
+            found[mode] = pkl
+    return dict(sorted(found.items()))
+
+
+def _load_gan_models(mode_paths: dict, cfg=None) -> dict:
+    """Load each pkl into memory, remapping tensors to CPU.
+
+    For 'prior' mode models saved without a clinical prior, inject cfg.clinical_prior
+    post-load so the unseen disease gets a meaningful conditioning signal.
+    """
+    import io, torch
+
+    class _CPUUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == 'torch.storage' and name == '_load_from_bytes':
+                return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+            return super().find_class(module, name)
+
+    gan_models = {}
+    for mode, pkl_path in mode_paths.items():
+        print(f"  Loading '{mode}' from {pkl_path.parent.name}/...")
+        with open(pkl_path, 'rb') as f:
+            model = _CPUUnpickler(f).load()
+        inner = getattr(model, '_model', model)
+        if hasattr(inner, 'set_device'):
+            inner.set_device(torch.device('cpu'))
+
+        if mode == "prior" and cfg is not None and cfg.clinical_prior:
+            _inject_clinical_prior(model, cfg.clinical_prior)
+
+        gan_models[mode] = model
+    return gan_models
+
+
+def _inject_clinical_prior(model, clinical_prior: dict) -> None:
+    """Walk model hierarchy to find the synthesizer and inject the clinical prior."""
+    obj = model
+    for _ in range(5):  # at most 5 levels deep
+        synthesizer = getattr(obj, '_model', None)
+        if synthesizer is None:
+            break
+        if hasattr(synthesizer, '_clinical_prior_normalised') and \
+                hasattr(synthesizer, '_cont_cols') and \
+                hasattr(synthesizer, '_clinical_mean_center'):
+            if not getattr(synthesizer, '_clinical_prior_raw', None):
+                prior_vec = np.array(
+                    [clinical_prior.get(c, 0.0) for c in synthesizer._cont_cols],
+                    dtype='float32')
+                synthesizer._clinical_prior_normalised = (
+                    (prior_vec - synthesizer._clinical_mean_center)
+                    / synthesizer._clinical_mean_scale
+                )
+                synthesizer._clinical_prior_raw = clinical_prior
+                print(f"    → Injected clinical prior ({len(clinical_prior)} features).")
+            return
+        obj = synthesizer
+
+
+def main(model_dirs, include_s3=False, cv=False, n_splits=5,
+         random_state=42, out_dir=None, stat_only=False, ml_only=False,
+         disease="aml", load_params=None):
+    cfg = CONFIGS[disease]
+    if isinstance(model_dirs, (str, Path)):
+        model_dirs = [model_dirs]
 
     if out_dir:
         base_dir = Path(out_dir)
     elif cv:
         tag = "with_s3" if include_s3 else "no_split"
-        base_dir = ROOT / "output" / f"{tag}_cv{n_splits}fold_seed{random_state}"
+        base_dir = ROOT / "output" / disease / f"{tag}_cv{n_splits}fold_seed{random_state}"
     else:
         tag = "with_s3" if include_s3 else "no_split"
-        base_dir = ROOT / "output" / f"{tag}_seed{random_state}"
+        base_dir = ROOT / "output" / disease / f"{tag}_seed{random_state}"
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Model dir  : {model_dir}")
+    df_full, _ = load_data(cfg)
+    n_unseen = (df_full[cfg.label_col] == cfg.unseen_label).sum()
+    n_syn    = N_SYN_MULTIPLIER * n_unseen
+
+    # ── Dataset statistics ────────────────────────────────────────────────────
+    disease_counts = (df_full[cfg.label_col].value_counts()
+                      .rename_axis('label').reset_index(name='n_patients'))
+    disease_counts['pct_of_total'] = (
+        disease_counts['n_patients'] / len(df_full) * 100).round(2)
+    stats_path = base_dir / "data_stats.csv"
+    disease_counts.to_csv(stats_path, index=False)
+
+    print(f"Disease    : {disease}  ({cfg.unseen_label})")
+    print(f"Unseen N   : {n_unseen}  →  n_syn = {N_SYN_MULTIPLIER}× = {n_syn}")
+    print(f"Model dirs : {[str(d) for d in model_dirs]}")
     print(f"Output dir : {base_dir}")
     print(f"CV mode    : {cv}  (n_splits={n_splits} | random_state={random_state})")
     print(f"Include S3 : {include_s3}")
 
-    # ── Load GAN models once ──────────────────────────────────────────────────
-    gan_models = {}
-    for mode in MODES:
-        pkl_path = model_dir / f"gan_model_S2_{mode}.pkl"
-        if not pkl_path.exists():
-            print(f"\n  WARNING: {pkl_path} not found — skipping '{mode}'")
-            continue
-        print(f"Loading '{mode}' model...")
-        with open(pkl_path, 'rb') as f:
-            gan_models[mode] = pickle.load(f)
+    # ── Resolve classifier hyperparameters ────────────────────────────────────
+    if load_params is not None:
+        import json
+        params_path = Path(load_params) if load_params is not True \
+                      else ROOT / "output" / disease / "best_classifier_params.json"
+        if not params_path.exists():
+            raise FileNotFoundError(
+                f"--load-params: {params_path} not found. "
+                f"Run tune_classifiers.py --disease {disease} first.")
+        with open(params_path) as f:
+            best_params = json.load(f)
+        classifiers = _build_classifiers_from_params(best_params)
+        print(f"Classifiers: loaded from {params_path}")
+        for name, clf in classifiers.items():
+            print(f"  {name}: {clf.get_params()}")
+    else:
+        classifiers = CLASSIFIERS
+        print(f"Classifiers: using defaults (no --load-params)")
 
-    # ── Part 1: Statistical analysis (once, all real AML vs synthetic) ──────────
+    # ── Discover and load GAN models ─────────────────────────────────────────
+    mode_paths = _discover_models(model_dirs)
+    if not mode_paths:
+        print(f"ERROR: no gan_model_S2_*.pkl files found in: {model_dirs}")
+        return
+    print(f"\nFound {len(mode_paths)} mode(s): {list(mode_paths.keys())}")
+    gan_models = _load_gan_models(mode_paths, cfg=cfg)
+
+    # ── Part 1: Statistical analysis ─────────────────────────────────────────
     if not ml_only:
         print(f"\n{'='*80}")
-        print("Part 1: Statistical similarity (all real AML vs synthetic AML)")
+        print(f"Part 1: Statistical similarity (all real {cfg.unseen_label} vs synthetic)")
         print(f"{'='*80}")
-        run_stat_analysis(gan_models, base_dir)
+        run_stat_analysis(gan_models, base_dir, cfg, n_syn)
 
     if stat_only:
         return
@@ -374,26 +625,26 @@ def main(model_dir, include_s3=False, cv=False, n_splits=5,
     all_fold_dfs = []
 
     if cv:
-        # ── Cross-validation mode ─────────────────────────────────────────────
         for fold, seen_train, unseen_train, test_df, clf_feat_cols in \
-                load_kfold(n_splits=n_splits, include_s3=include_s3,
+                load_kfold(cfg, n_splits=n_splits, include_s3=include_s3,
                            random_state=random_state):
 
             print(f"\n{'='*60}  Fold {fold+1}/{n_splits}  {'='*60}")
             results = evaluate_split(seen_train, unseen_train, test_df,
-                                     clf_feat_cols, gan_models, include_s3)
+                                     clf_feat_cols, gan_models, include_s3,
+                                     cfg=cfg, n_syn=n_syn,
+                                     classifiers=classifiers,
+                                     random_state=random_state)
             fold_df = results_to_df(results, fold=fold + 1)
             all_fold_dfs.append(fold_df)
 
-            # Print fold summary
             for _, row in fold_df[fold_df['Classifier'] == 'RandomForest'].iterrows():
                 print(f"  RF  {row['Scenario']:35s}  "
-                      f"Recall={row['Recall (AML)']:.4f}  "
-                      f"F1={row['F1 (AML)']:.4f}  "
-                      f"ROC-AUC={row['ROC-AUC (AML)']:.4f}  "
+                      f"Recall={row['Recall']:.4f}  "
+                      f"F1={row['F1']:.4f}  "
+                      f"ROC-AUC={row['ROC-AUC (unseen)']:.4f}  "
                       f"TP={row['TP']}/{row['N unseen test']}")
 
-        # Save per-fold + aggregated
         all_folds_df = pd.concat(all_fold_dfs, ignore_index=True)
         all_folds_df.to_csv(base_dir / "evaluation_results_all_folds.csv", index=False)
         print(f"\nSaved per-fold results → {base_dir}/evaluation_results_all_folds.csv")
@@ -408,12 +659,14 @@ def main(model_dir, include_s3=False, cv=False, n_splits=5,
         print(cv_table.to_string())
 
     else:
-        # ── Single-seed mode ──────────────────────────────────────────────────
         seen_train, unseen_train, test_df, clf_feat_cols = load_and_split(
-            include_s3=include_s3, random_state=random_state)
+            cfg, include_s3=include_s3, random_state=random_state)
 
         results = evaluate_split(seen_train, unseen_train, test_df,
-                                 clf_feat_cols, gan_models, include_s3)
+                                 clf_feat_cols, gan_models, include_s3,
+                                 cfg=cfg, n_syn=n_syn,
+                                 classifiers=classifiers,
+                                 random_state=random_state)
 
         table = results_to_df(results).set_index(['Classifier', 'Scenario'])
         print(f"\n{'='*80}")
@@ -421,10 +674,15 @@ def main(model_dir, include_s3=False, cv=False, n_splits=5,
         table.to_csv(base_dir / "evaluation_results.csv")
         print(f"\nSaved → {base_dir}/evaluation_results.csv")
 
+        print("\nSaving confusion matrices...")
+        save_confusion_matrices(results, base_dir)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-dir',    type=str, required=True)
+    parser.add_argument('--model-dir',    type=str, nargs='+', required=True,
+                        help='One or more directories containing gan_model_S2_*.pkl files. '
+                             'Models from later (lexicographically) dirs take precedence.')
     parser.add_argument('--include-s3',   action='store_true')
     parser.add_argument('--cv',           action='store_true',
                         help='Run stratified k-fold CV over full dataset')
@@ -436,9 +694,18 @@ if __name__ == '__main__':
                         help='Run statistical analysis only (skip ML classifiers)')
     parser.add_argument('--ml-only',      action='store_true',
                         help='Run ML classifier evaluation only (skip statistical analysis)')
+    parser.add_argument('--disease',      type=str, default='aml',
+                        choices=list(CONFIGS.keys()),
+                        help='Experiment to evaluate (default: aml)')
+    parser.add_argument('--load-params',  nargs='?', const=True, default=None,
+                        metavar='PATH',
+                        help='Load tuned classifier params from JSON produced by '
+                             'tune_classifiers.py. Omit PATH to use the default '
+                             'output/<disease>/best_classifier_params.json, or '
+                             'supply an explicit path.')
     args = parser.parse_args()
     main(
-        model_dir=args.model_dir,
+        model_dirs=args.model_dir,
         include_s3=args.include_s3,
         cv=args.cv,
         n_splits=args.n_splits,
@@ -446,4 +713,6 @@ if __name__ == '__main__':
         out_dir=args.out_dir,
         stat_only=args.stat_only,
         ml_only=args.ml_only,
+        disease=args.disease,
+        load_params=args.load_params,
     )

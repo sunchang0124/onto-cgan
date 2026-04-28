@@ -3,7 +3,9 @@
 # delta = 2e-6 #
 
 import warnings
+import os
 
+import joblib
 import numpy as np
 import pandas as pd
 import math
@@ -110,37 +112,18 @@ class EmbeddingDecoder(Module):
     With few seen diseases, a small linear architecture with strong L2
     regularisation is used to avoid overfitting.
     """
-    def __init__(self, embed_size, n_features, hidden_dim=32):
+    def __init__(self, embed_size, n_features, hidden_dim=128):
         super().__init__()
         self.net = Sequential(
             Linear(embed_size, hidden_dim),
             LeakyReLU(0.2),
-            Linear(hidden_dim, n_features),
+            Linear(hidden_dim, hidden_dim // 2),
+            LeakyReLU(0.2),
+            Linear(hidden_dim // 2, n_features),
         )
 
     def forward(self, x):
         return self.net(x)
-
-
-class EmbeddingDecoderVar(Module):
-    """Maps ontology embedding → (clinical feature means, log_std).
-
-    Used in conditioning_mode='decoder_var'. Shares a trunk with two heads:
-    one for predicted mean and one for predicted log_std. Trained with NLL loss
-    plus L2 regularisation on log_std to prevent extreme variance predictions.
-
-    Conditioning = [ontology_embed | predicted_mean | predicted_std]
-    Effective embed size = embed_size + 2 * n_features
-    """
-    def __init__(self, embed_size, n_features, hidden_dim=32):
-        super().__init__()
-        self.shared     = Sequential(Linear(embed_size, hidden_dim), LeakyReLU(0.2))
-        self.mean_head   = Linear(hidden_dim, n_features)
-        self.logstd_head = Linear(hidden_dim, n_features)
-
-    def forward(self, x):
-        h = self.shared(x)
-        return self.mean_head(h), self.logstd_head(h)
 
 
 class Onto_DPCGANSynthesizer(BaseSynthesizer):
@@ -206,7 +189,8 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
                  log_frequency=True, verbose=False, epochs=300, pac=10, cuda=True, private=False,
                  wandb=False, conditional_columns=None,
                  conditioning_mode='ontology',
-                 clinical_prior=None):
+                 clinical_prior=None,
+                 saved_transformer=None):
 
         assert batch_size % 2 == 0
 
@@ -236,12 +220,8 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
         self.conditional_columns = conditional_columns
         self.wandb = wandb
         self._conditioning_mode = conditioning_mode
-        # clinical_prior: dict {feature_name: value} — used in 'prior' mode for ZSL.
-        # Provides external reference values (e.g. from published literature) for
-        # unseen diseases instead of the cosine-weighted estimate.
-        self._clinical_prior_raw = clinical_prior or {}
-  
-            
+        self.saved_transformer = saved_transformer if saved_transformer is not None \
+            else os.path.join(os.getcwd(), 'fitted_transformer.pkl')
 
         if not cuda or not torch.cuda.is_available():
             device = 'cpu'
@@ -330,37 +310,22 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
         """
         batch = len(cat_ids)
         ont_np = self._data_sampler.get_embeds_from_cat_ids(cat_ids, batch)
-        ont_t = torch.from_numpy(ont_np).to(self._device)
+        ont_t = torch.from_numpy(ont_np).to(self._device, non_blocking=True)
 
         if self._conditioning_mode == "ontology":
             return ont_t
 
-        elif self._conditioning_mode == "prior":
-            # Training: condition on real per-disease clinical mean (same as old augmented)
-            irls = self._data_sampler.get_rds(cat_ids, batch)
-            clin_np = np.stack([self._disease_clinical_means[iri] for iri in irls])
-            clin_t = torch.from_numpy(clin_np).to(self._device)
-            return torch.cat([ont_t, clin_t], dim=1)
-
         elif self._conditioning_mode == "decoder":
-            # Condition on [ontology_embed | decoder(ontology_embed)]
             dec_out = self._embedding_decoder(ont_t)
             return torch.cat([ont_t, dec_out], dim=1)
 
         elif self._conditioning_mode == "decoder_contrast":
-            # Condition on [ontology_embed | decoder(ont) - decoder(nearest_neighbour)]
             irls = self._data_sampler.get_rds(cat_ids, batch)
             nn_dec_np = np.stack(
                 [self._disease_nn_dec_out[iri] for iri in irls]).astype('float32')
-            nn_dec_t = torch.from_numpy(nn_dec_np).to(self._device)
+            nn_dec_t = torch.from_numpy(nn_dec_np).to(self._device, non_blocking=True)
             dec_out = self._embedding_decoder(ont_t)
             return torch.cat([ont_t, dec_out - nn_dec_t], dim=1)
-
-        elif self._conditioning_mode == "decoder_var":
-            # Condition on [ontology_embed | predicted_mean | predicted_std]
-            mean_out, log_std_out = self._embedding_decoder_var(ont_t)
-            std_out = torch.exp(log_std_out)
-            return torch.cat([ont_t, mean_out, std_out], dim=1)
 
         else:
             raise ValueError(f"Unknown conditioning_mode: {self._conditioning_mode!r}")
@@ -467,32 +432,47 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
         _, idx = np.unique(rds, return_index=True)
         rds = rds[np.sort(idx)]
 
-        # ── Fit IRI transformer separately (sampler only) ─────────────────────
-        # This avoids a BayesianGMM stochastic mismatch: if we fit a single
-        # full_transformer on [IRI | rest] and a separate self._transformer on
-        # [rest], the GMM may choose different valid components for the same
-        # continuous columns, causing data_dim ≠ sampler output dim.
         iri_col_name = train_data.columns[0]
-        iri_df = train_data[[iri_col_name]].copy()
-        iri_transformer = DataTransformer()
-        iri_transformer.fit(iri_df, [iri_col_name])
-        train_iri = iri_transformer.transform(iri_df)
 
-        # ── Fit main transformer on non-IRI data (defines Generator output space)
-        # Save original (pre-transform) data for clinical-mean computation
-        train_data = train_data.drop(columns=iri_col_name, axis=1)
-        train_data_orig = train_data.copy()
+        if self.saved_transformer and os.path.exists(self.saved_transformer):
+            print(f"Found existing fitted transformer - {self.saved_transformer}")
+            print("Loading fitted transformer...")
+            cache = joblib.load(self.saved_transformer)
+            iri_transformer     = cache['iri_transformer']
+            self._transformer   = cache['transformer']
+            train_data_full     = cache['train_data_full']
+            train_data_orig     = cache['train_data_orig']
+            rds                 = cache['rds']
+        else:
+            # ── Fit IRI transformer separately (sampler only) ─────────────────
+            iri_df = train_data[[iri_col_name]].copy()
+            iri_transformer = DataTransformer()
+            iri_transformer.fit(iri_df, [iri_col_name])
+            train_iri = iri_transformer.transform(iri_df)
 
-        self._transformer = DataTransformer()
-        self._transformer.fit(train_data, discrete_columns)
-        train_data = self._transformer.transform(train_data)
+            # ── Fit main transformer on non-IRI data ──────────────────────────
+            train_data = train_data.drop(columns=iri_col_name, axis=1)
+            train_data_orig = train_data.copy()
+
+            self._transformer = DataTransformer()
+            self._transformer.fit(train_data, discrete_columns)
+            train_data = self._transformer.transform(train_data)
+
+            train_data_full = np.hstack([train_iri, train_data])
+
+            cache = {
+                'iri_transformer': iri_transformer,
+                'transformer':     self._transformer,
+                'train_data_full': train_data_full,
+                'train_data_orig': train_data_orig,
+                'rds':             rds,
+            }
+            joblib.dump(cache, self.saved_transformer)
+            print(f"Saving fitted transformer to {self.saved_transformer}...")
 
         data_dim = self._transformer.output_dimensions
 
-        # ── Combine for sampler: [IRI_dims | data_dims] ──────────────────────
-        # train_data_full[:, _rd_col_dim:] == train_data exactly, so sampler and
-        # Generator/Discriminator share the same feature space.
-        train_data_full = np.hstack([train_iri, train_data])
+        # ── Combine output_info for sampler ──────────────────────────────────
         full_output_info_list = iri_transformer.output_info_list + self._transformer.output_info_list
 
         self._data_sampler = Onto_DataSampler(
@@ -523,40 +503,7 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
         # ── Mode-specific setup ──────────────────────────────────────────────────
         self._effective_embed_size = self._embedding.embed_size  # default
 
-        if self._conditioning_mode == "prior":
-            # Per-disease mean of continuous features (normalised globally).
-            # At training time: same as the old augmented mode (use real data means).
-            # At ZSL inference: use self._clinical_prior_raw instead of cosine estimate.
-            cont_cols = [c for c in train_data_orig.columns if c not in discrete_columns]
-            self._cont_cols = cont_cols
-            iri_col = train_data_orig[self._rd_label_col_name].map(self._label_to_iri)
-            means = {}
-            for iri in ordered_iris:
-                mask = iri_col == iri
-                subset = train_data_orig.loc[mask, cont_cols]
-                means[iri] = subset.mean().values.astype('float32')
-            all_means = np.stack(list(means.values()))
-            self._clinical_mean_center = all_means.mean(axis=0)
-            self._clinical_mean_scale  = all_means.std(axis=0) + 1e-8
-            # Normalise and store seen disease means
-            self._disease_clinical_means = {
-                iri: (v - self._clinical_mean_center) / self._clinical_mean_scale
-                for iri, v in means.items()
-            }
-            # Pre-normalise the external prior so it is on the same scale
-            if self._clinical_prior_raw:
-                prior_vec = np.array(
-                    [self._clinical_prior_raw.get(c, 0.0) for c in cont_cols],
-                    dtype='float32')
-                self._clinical_prior_normalised = (
-                    (prior_vec - self._clinical_mean_center) / self._clinical_mean_scale
-                )
-            else:
-                # Fallback: zero vector (no prior provided — behaves like zero-mean)
-                self._clinical_prior_normalised = np.zeros(len(cont_cols), dtype='float32')
-            self._effective_embed_size = self._embedding.embed_size + len(cont_cols)
-
-        elif self._conditioning_mode in ("decoder", "decoder_contrast", "decoder_var"):
+        if self._conditioning_mode in ("decoder", "decoder_contrast"):
             # Compute per-disease clinical means (shared setup for all decoder variants)
             cont_cols = [c for c in train_data_orig.columns if c not in discrete_columns]
             self._cont_cols = cont_cols
@@ -581,60 +528,36 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
             X_dec = torch.tensor(seen_embeds, dtype=torch.float32, device=self._device)
             Y_dec = torch.tensor(seen_means,  dtype=torch.float32, device=self._device)
 
-            if self._conditioning_mode in ("decoder", "decoder_contrast"):
-                # Train EmbeddingDecoder: embedding → clinical mean
-                self._embedding_decoder = EmbeddingDecoder(
-                    self._embedding.embed_size, len(cont_cols)
-                ).to(self._device)
-                opt_dec = optim.Adam(
-                    self._embedding_decoder.parameters(), lr=1e-3, weight_decay=1e-2)
-                for _ in range(2000):
-                    opt_dec.zero_grad()
-                    pred = self._embedding_decoder(X_dec)
-                    loss_dec = torch.nn.functional.mse_loss(pred, Y_dec)
-                    loss_dec.backward()
-                    opt_dec.step()
-                print(f"  EmbeddingDecoder trained — final MSE: {loss_dec.item():.4f}")
-                self._effective_embed_size = self._embedding.embed_size + len(cont_cols)
+            # Train EmbeddingDecoder: embedding → clinical mean
+            self._embedding_decoder = EmbeddingDecoder(
+                self._embedding.embed_size, len(cont_cols)
+            ).to(self._device)
+            opt_dec = optim.Adam(
+                self._embedding_decoder.parameters(), lr=1e-3, weight_decay=1e-2)
+            for _ in range(2000):
+                opt_dec.zero_grad()
+                pred = self._embedding_decoder(X_dec)
+                loss_dec = torch.nn.functional.mse_loss(pred, Y_dec)
+                loss_dec.backward()
+                opt_dec.step()
+            print(f"  EmbeddingDecoder trained — final MSE: {loss_dec.item():.4f}")
+            self._effective_embed_size = self._embedding.embed_size + len(cont_cols)
 
-                if self._conditioning_mode == "decoder_contrast":
-                    # Store seen embeddings and precompute decoder(nearest_neighbour) per disease
-                    self._seen_embeds_np = seen_embeds           # [n_seen, embed_size]
-                    self._seen_iris_list = list(ordered_iris)
-                    with torch.no_grad():
-                        all_dec_out = self._embedding_decoder(X_dec).cpu().numpy()  # [n_seen, n_features]
-                    self._seen_dec_out_np = all_dec_out
-                    seen_norms = seen_embeds / (
-                        np.linalg.norm(seen_embeds, axis=1, keepdims=True) + 1e-12)
-                    self._disease_nn_dec_out = {}
-                    for i, iri in enumerate(ordered_iris):
-                        sims = seen_norms @ seen_norms[i]
-                        sims[i] = -1  # exclude self
-                        nn_idx = int(np.argmax(sims))
-                        self._disease_nn_dec_out[iri] = all_dec_out[nn_idx]
-                    print(f"  decoder_contrast: precomputed nearest-neighbour decoder outputs.")
-
-            elif self._conditioning_mode == "decoder_var":
-                # Train EmbeddingDecoderVar: embedding → (mean, log_std)
-                self._embedding_decoder_var = EmbeddingDecoderVar(
-                    self._embedding.embed_size, len(cont_cols)
-                ).to(self._device)
-                opt_var = optim.Adam(
-                    self._embedding_decoder_var.parameters(), lr=1e-3, weight_decay=1e-2)
-                for _ in range(2000):
-                    opt_var.zero_grad()
-                    mean_pred, logstd_pred = self._embedding_decoder_var(X_dec)
-                    # NLL loss: 0.5*(log_var + (y - mean)^2 / var)
-                    var_pred = torch.exp(2 * logstd_pred) + 1e-8
-                    nll = 0.5 * (2 * logstd_pred + (Y_dec - mean_pred) ** 2 / var_pred)
-                    # L2 on log_std to prevent extreme variance
-                    l2_log_std = (logstd_pred ** 2).mean()
-                    loss_var = nll.mean() + 0.1 * l2_log_std
-                    loss_var.backward()
-                    opt_var.step()
-                print(f"  EmbeddingDecoderVar trained — final NLL: {loss_var.item():.4f}")
-                # effective_embed_size = embed_size + 2 * n_features (mean + std)
-                self._effective_embed_size = self._embedding.embed_size + 2 * len(cont_cols)
+            if self._conditioning_mode == "decoder_contrast":
+                self._seen_embeds_np = seen_embeds
+                self._seen_iris_list = list(ordered_iris)
+                with torch.no_grad():
+                    all_dec_out = self._embedding_decoder(X_dec).cpu().numpy()
+                self._seen_dec_out_np = all_dec_out
+                seen_norms = seen_embeds / (
+                    np.linalg.norm(seen_embeds, axis=1, keepdims=True) + 1e-12)
+                self._disease_nn_dec_out = {}
+                for i, iri in enumerate(ordered_iris):
+                    sims = seen_norms @ seen_norms[i]
+                    sims[i] = -1
+                    nn_idx = int(np.argmax(sims))
+                    self._disease_nn_dec_out[iri] = all_dec_out[nn_idx]
+                print(f"  decoder_contrast: precomputed nearest-neighbour decoder outputs.")
 
         # ── Networks ─────────────────────────────────────────────────────────────
         self._generator = Generator(
@@ -684,7 +607,7 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
                     if condvec_pair is None:
                         c_pair_1, m_pair_1, col_pair_1, opt_pair_1 = None, None, None, None
                         real = self._data_sampler.sample_data_pair(self._batch_size, col_pair_1, opt_pair_1)
-                        real = torch.from_numpy(real.astype('float32')).to(self._device)
+                        real = torch.from_numpy(real.astype('float32')).to(self._device, non_blocking=True)
                         fake = self._generator(fakez)
                         fakeact = self._apply_activate(fake)
                         real_cat = real
@@ -703,7 +626,7 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
 
                         real = self._data_sampler.sample_data_pair(
                             self._batch_size, col_pair_1[perm], opt_pair_1[perm])
-                        real = torch.from_numpy(real.astype('float32')).to(self._device)
+                        real = torch.from_numpy(real.astype('float32')).to(self._device, non_blocking=True)
 
                         real_embeddings_2 = self._get_conditioning(c_pair_2)
 
@@ -726,7 +649,7 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
                             for parameter in discriminator.parameters():
                                 parameter.register_hook(
                                     lambda grad: grad + (1 / self._batch_size) * sigma
-                                    * torch.randn(parameter.shape)
+                                    * torch.randn(parameter.shape, device=self._device)
                                 )
                     #### DP ####
 
@@ -759,8 +682,8 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
 
                     real_embeddings = self._get_conditioning(c_pair_1)
 
-                    c_pair_1 = torch.from_numpy(c_pair_1).to(self._device)
-                    m_pair_1 = torch.from_numpy(m_pair_1).to(self._device)
+                    c_pair_1 = torch.from_numpy(c_pair_1).to(self._device, non_blocking=True)
+                    m_pair_1 = torch.from_numpy(m_pair_1).to(self._device, non_blocking=True)
                     fakez = torch.cat([fakez, real_embeddings], dim=1)
 
                     fake = self._generator(fakez)
@@ -774,7 +697,7 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
                     # Compare against ontology embedding regardless of mode
                     ont_np = self._data_sampler.get_embeds_from_cat_ids(
                         c_pair_1.cpu().numpy(), self._batch_size)
-                    ont_t = torch.from_numpy(ont_np).to(self._device)
+                    ont_t = torch.from_numpy(ont_np).to(self._device, non_blocking=True)
                     cross_entropy_pair = torch.nn.functional.mse_loss(
                         generated_embeddings_t, ont_t)
                     #######################################################
@@ -835,27 +758,15 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
     def _sample_conditioning_for_iris(self, iris):
         """Return conditioning tensor [len(iris), effective_embed_size] for sample().
 
-        - ontology:          frozen ontology embedding
-        - prior:             ontology + clinical mean (unseen → external clinical prior)
-        - decoder:           ontology + decoder(ontology) → predicted clinical mean
-        - decoder_contrast:  ontology + (decoder(ont) - decoder(nearest_seen))
-        - decoder_var:       ontology + predicted_mean + predicted_std
+        - ontology:         frozen ontology embedding
+        - decoder:          ontology + decoder(ontology) → predicted clinical mean
+        - decoder_contrast: ontology + (decoder(ont) - decoder(nearest_seen))
         """
         ont_np = self._data_sampler.get_rd_embeds(iris)  # [B, embed_size]
-        ont_t = torch.from_numpy(ont_np).to(self._device)
+        ont_t = torch.from_numpy(ont_np).to(self._device, non_blocking=True)
 
         if self._conditioning_mode == "ontology":
             return ont_t
-
-        elif self._conditioning_mode == "prior":
-            clin_rows = []
-            for iri in iris:
-                if iri in self._disease_clinical_means:
-                    clin_rows.append(self._disease_clinical_means[iri])
-                else:
-                    clin_rows.append(self._clinical_prior_normalised)
-            clin_t = torch.tensor(np.stack(clin_rows), dtype=torch.float32, device=self._device)
-            return torch.cat([ont_t, clin_t], dim=1)
 
         elif self._conditioning_mode == "decoder":
             with torch.no_grad():
@@ -870,10 +781,8 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
             nn_dec_rows = []
             for i, iri in enumerate(iris):
                 if iri in self._disease_nn_dec_out:
-                    # Seen disease: use precomputed NN decoder output (self excluded)
                     nn_dec_rows.append(self._disease_nn_dec_out[iri])
                 else:
-                    # Unseen disease: find nearest seen disease on the fly
                     q = ont_np[i] / (np.linalg.norm(ont_np[i]) + 1e-12)
                     sims = seen_norms @ q
                     nn_idx = int(np.argmax(sims))
@@ -881,12 +790,6 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
             nn_dec_t = torch.tensor(
                 np.stack(nn_dec_rows), dtype=torch.float32, device=self._device)
             return torch.cat([ont_t, dec_out - nn_dec_t], dim=1)
-
-        elif self._conditioning_mode == "decoder_var":
-            with torch.no_grad():
-                mean_out, log_std_out = self._embedding_decoder_var(ont_t)
-            std_out = torch.exp(log_std_out)
-            return torch.cat([ont_t, mean_out, std_out], dim=1)
 
         else:
             raise ValueError(f"Unknown conditioning_mode: {self._conditioning_mode!r}")
@@ -920,10 +823,10 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
             unseen_rds = unseen_rds[:self._batch_size]
 
         for i in range(steps):
-            mean = torch.zeros(self._batch_size, self._noise_dim)
+            mean = torch.zeros(self._batch_size, self._noise_dim, device=self._device)
 
             std = mean + 1
-            fakez = torch.normal(mean=mean, std=std).to(self._device)
+            fakez = torch.normal(mean=mean, std=std)
 
             if len(unseen_rds) > 0:
                 random.shuffle(unseen_rds)
@@ -977,9 +880,13 @@ class Onto_DPCGANSynthesizer(BaseSynthesizer):
         return sampled_data
 
     def set_device(self, device):
-        self._device = device
-        if self._generator is not None:
-            self._generator.to(self._device)
+        self._device = torch.device(device) if not isinstance(device, torch.device) else device
+        for attr in ('_generator', '_discriminator', '_embedding_decoder'):
+            m = getattr(self, attr, None)
+            if m is not None:
+                m.to(self._device)
+        if getattr(self, '_rd_embedding_matrix', None) is not None:
+            self._rd_embedding_matrix = self._rd_embedding_matrix.to(self._device)
 
     def xai_discriminator(self, data_samples):
 

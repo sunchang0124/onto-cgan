@@ -1,8 +1,8 @@
 
 from gensim.models import KeyedVectors
-from typing import Optional
+from typing import Optional, Dict
 import numpy as np
-import os, json
+import os, json, re
 
 # ---------------------------
 # Existing OntologyEmbedding
@@ -243,26 +243,252 @@ class LLMEmbedding:
 
 
 # ---------------------------
+# OWLEmbedding
+# ---------------------------
+
+# Pattern for ontology codes that are not human-readable names, e.g. "ORPHA:519", "HP:0001234"
+_CODE_PATTERN = re.compile(r'^[A-Z]+:\d+$')
+
+
+def _best_label(labels: list) -> Optional[str]:
+    """Return the first label that is not an ontology code (e.g. ORPHA:54057)."""
+    clean = [l for l in labels if not _CODE_PATTERN.match(str(l).strip())]
+    if clean:
+        return str(clean[0]).strip()
+    if labels:
+        return str(labels[0]).strip()
+    return None
+
+
+class OWLEmbedding:
+    """Embed ontology classes from an OWL file using a sentence-transformers model.
+
+    Parses the OWL file once with owlready2, builds an IRI → text mapping
+    (label + optional definition + optional synonyms), then encodes each IRI
+    on demand using the specified sentence-transformers model.
+
+    This single class covers:
+      - Hierarchy-aware embeddings:  model_name="Hierarchy-Transformers/HiT-MiniLM-L12-ORDO"
+      - Biomedical entity linking:   model_name="cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+      - Rare-disease concepts:       model_name="FremyCompany/BioLORD-2023"
+      - General biomedical text:     model_name="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+      - General text baseline:       model_name="sentence-transformers/all-MiniLM-L6-v2"
+
+    Parameters
+    ----------
+    owl_path : str
+        Path to the combined OWL file (e.g. hpObo_hoom_ordo.owl).
+    model_name : str
+        HuggingFace model name or local path for sentence-transformers.
+    include_definition : bool
+        Append the class definition (IAO:0000115) to the label text. Default True.
+    include_synonyms : bool
+        Append alternative_term / synonym values. Default False.
+    fallback_labels : dict
+        {IRI: label} for any IRI missing from the OWL file. Useful for classes
+        that were added after the OWL snapshot.
+    cache_path : str
+        Path to a JSON file for caching computed embeddings across runs.
+    normalize : bool
+        L2-normalise embeddings. Default False.
+    namespaces : list of str
+        Only index classes whose IRI contains one of these strings.
+        Default ["Orphanet", "HP_"] — excludes HOOM mapping nodes.
+    """
+
+    def __init__(
+        self,
+        owl_path: str,
+        model_name: str,
+        include_definition: bool = True,
+        include_synonyms: bool = False,
+        fallback_labels: Optional[Dict[str, str]] = None,
+        cache_path: Optional[str] = None,
+        normalize: bool = False,
+        namespaces: Optional[list] = None,
+    ):
+        self._normalize = normalize
+        self._cache = _LocalEmbeddingCache(cache_path) if cache_path else None
+        self._fallback = fallback_labels or {}
+
+        # ── Load OWL and build IRI → text map ─────────────────────────────────
+        _ns = namespaces if namespaces is not None else ["Orphanet", "HP_"]
+        self._iri_to_text = self._build_text_map(
+            owl_path, _ns, include_definition, include_synonyms)
+        print(f"  OWLEmbedding: indexed {len(self._iri_to_text)} classes from {owl_path}")
+
+        # ── Load sentence-transformers model ───────────────────────────────────
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(model_name)
+        self.embed_size = self._model.get_sentence_embedding_dimension()
+        print(f"  OWLEmbedding: model={model_name!r}  embed_size={self.embed_size}")
+
+    @staticmethod
+    def _build_text_map(
+        owl_path: str,
+        namespaces: list,
+        include_definition: bool,
+        include_synonyms: bool,
+    ) -> Dict[str, str]:
+        """Parse the OWL file and return {IRI: text_for_encoding}."""
+        import owlready2
+        onto = owlready2.get_ontology(owl_path).load()
+
+        iri_to_text = {}
+        for cls in onto.classes():
+            iri = cls.iri
+            if not any(ns in iri for ns in namespaces):
+                continue
+
+            # ── Label ──────────────────────────────────────────────────────────
+            label = _best_label(list(cls.label))
+            if not label:
+                # fall back to comment if no label
+                comments = list(cls.comment)
+                label = str(comments[0]).strip() if comments else None
+            if not label:
+                continue  # skip classes with no usable name
+
+            parts = [label]
+
+            # ── Synonyms ───────────────────────────────────────────────────────
+            if include_synonyms:
+                syns = []
+                for attr in ("alternative_term", "hasExactSynonym",
+                             "hasBroadSynonym", "hasNarrowSynonym"):
+                    syns += [str(s) for s in getattr(cls, attr, [])]
+                if syns:
+                    parts.append("Also known as: " + ", ".join(syns[:3]) + ".")
+
+            # ── Definition ─────────────────────────────────────────────────────
+            if include_definition:
+                defn = getattr(cls, "definition", None)
+                if defn:
+                    defn_str = str(list(defn)[0]).strip() if hasattr(defn, "__iter__") else str(defn).strip()
+                    if defn_str:
+                        parts.append(defn_str)
+
+            iri_to_text[iri] = " ".join(parts)
+
+        return iri_to_text
+
+    def _encode(self, text: str) -> np.ndarray:
+        vec = self._model.encode(text, convert_to_numpy=True,
+                                 show_progress_bar=False).astype(np.float32)
+        if self._normalize:
+            vec = vec / (np.linalg.norm(vec) + 1e-12)
+        return vec
+
+    def get_embedding(self, iri: str) -> np.ndarray:
+        key = iri.strip()
+
+        # 1) cache hit
+        if self._cache:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached
+
+        # 2) build text
+        text = self._iri_to_text.get(key)
+        if text is None:
+            # fallback label provided by caller
+            text = self._fallback.get(key)
+        if text is None:
+            # last resort: use the local name from the IRI
+            text = key.rstrip("/").split("/")[-1].replace("_", " ")
+
+        # 3) encode
+        vec = self._encode(text)
+
+        # 4) persist
+        if self._cache:
+            self._cache.put(key, vec)
+            self._cache.save()
+
+        return vec
+
+
+# ---------------------------
 # Simple factory helper
 # ---------------------------
 def make_embedding_model(
-    use_llm: bool,
+    use_llm: bool = False,
     *,
-    # OntologyEmbedding (gensim) args
+    # OntologyEmbedding (gensim, legacy) args
     embedding_path: Optional[str] = None,
     embedding_size: Optional[int] = None,
     hp_dict_fn: Optional[str] = None,
     rd_dict_fn: Optional[str] = None,
-    # LLMEmbedding args
-    llm_backend: str = "openai",
-    cache_path: Optional[str] = None,   # now used by BOTH backends
+    # OWLEmbedding args  ← new
+    owl_path: Optional[str] = None,
+    model_name: Optional[str] = None,
+    include_definition: bool = True,
+    include_synonyms: bool = False,
+    fallback_labels: Optional[Dict[str, str]] = None,
+    namespaces: Optional[list] = None,
+    # Shared args
+    cache_path: Optional[str] = None,
     normalize: bool = False,
+    # LLMEmbedding (OpenAI / hf-local) args — kept for backward compat
+    llm_backend: str = "openai",
     **llm_kwargs
 ):
+    """Return an embedding model with a unified get_embedding(iri) → np.ndarray interface.
+
+    Three backends
+    --------------
+    1. OWLEmbedding (recommended — OWL file + sentence-transformers):
+       Provide owl_path + model_name.
+
+       Examples::
+
+           # Hierarchy-aware (HiT, trained on ORDO)
+           make_embedding_model(
+               owl_path="data/ontology_emb/hpObo_hoom_ordo.owl",
+               model_name="Hierarchy-Transformers/HiT-MiniLM-L12-ORDO",
+               cache_path="cache_hit.json",
+           )
+
+           # Biomedical entity linking (SapBERT)
+           make_embedding_model(
+               owl_path="data/ontology_emb/hpObo_hoom_ordo.owl",
+               model_name="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+               cache_path="cache_sapbert.json",
+           )
+
+           # Rare-disease concepts (BioLORD-2023)
+           make_embedding_model(
+               owl_path="data/ontology_emb/hpObo_hoom_ordo.owl",
+               model_name="FremyCompany/BioLORD-2023",
+               include_definition=True,
+               cache_path="cache_biolord.json",
+           )
+
+           # General biomedical text (PubMedBERT)
+           make_embedding_model(
+               owl_path="data/ontology_emb/hpObo_hoom_ordo.owl",
+               model_name="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
+               cache_path="cache_pubmedbert.json",
+           )
+
+    2. OntologyEmbedding (legacy gensim KeyedVectors):
+       Provide embedding_path + embedding_size + hp_dict_fn + rd_dict_fn.
+
+    3. LLMEmbedding (OpenAI API or raw HuggingFace):
+       Set use_llm=True + llm_backend.
     """
-    Returns either OntologyEmbedding or LLMEmbedding, same get_embedding() API.
-    """
-    if use_llm:
+    if owl_path and model_name:
+        return OWLEmbedding(
+            owl_path=owl_path,
+            model_name=model_name,
+            include_definition=include_definition,
+            include_synonyms=include_synonyms,
+            fallback_labels=fallback_labels,
+            cache_path=cache_path,
+            normalize=normalize,
+            namespaces=namespaces,
+        )
+    elif use_llm:
         return LLMEmbedding(
             backend=llm_backend,
             cache_path=cache_path,
@@ -271,7 +497,11 @@ def make_embedding_model(
         )
     else:
         if not all([embedding_path, embedding_size, hp_dict_fn, rd_dict_fn]):
-            raise ValueError("Provide embedding_path, embedding_size, hp_dict_fn, rd_dict_fn for OntologyEmbedding.")
+            raise ValueError(
+                "Provide either (owl_path + model_name) for OWLEmbedding, "
+                "or (embedding_path + embedding_size + hp_dict_fn + rd_dict_fn) "
+                "for the legacy gensim OntologyEmbedding."
+            )
         return OntologyEmbedding(
             embedding_path, embedding_size, hp_dict_fn, rd_dict_fn,
             cache_path=cache_path
